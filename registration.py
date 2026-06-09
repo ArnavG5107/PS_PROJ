@@ -1,11 +1,16 @@
 """
-Week 2 — Image Registration Pipeline
-Image Fusion Research Programme · Phase 1: Foundations
-
+registration.py
+===============
 Processes three fixed folders at the project root:
-  P1W2/  — same-modality pair  (ORB + SIFT + RANSAC homography)
-  P2W2/  — same-modality pair  (ORB + SIFT + RANSAC homography)
+  P1W2/  — same-modality pair  (ORB or SIFT + RANSAC homography — best auto-selected)
+  P2W2/  — same-modality pair  (ORB or SIFT + RANSAC homography — best auto-selected)
   P3W2/  — cross-modal IR→Visible pair (Mattes MI via SimpleITK)
+
+Modality (same vs cross) is read directly from TARGET_FOLDERS — the user's
+domain knowledge is authoritative and more reliable than any runtime heuristic.
+
+For same-modal pairs, ORB and SIFT are both probed lightly; whichever achieves
+the higher RANSAC inlier ratio is used for the full registration run.
 
 Outputs per pair:
   results/same_modal/   → keypoints, matches, inliers, registered image,
@@ -35,14 +40,16 @@ from sklearn.metrics import mutual_info_score
 
 IMAGE_EXTS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-# (folder_name, modality_mode, display_label)
-# "same"  → ORB + SIFT + RANSAC
+# (folder_name, modality, display_label)
+# modality is AUTHORITATIVE — set this correctly for your data.
+# "same"  → ORB vs SIFT probe → best method chosen → RANSAC homography
 # "cross" → SimpleITK Mattes MI maximisation
 TARGET_FOLDERS = [
     ("P1W2", "same",  "P1W2"),
     ("P2W2", "same",  "P2W2"),
     ("P3W2", "cross", "P3W2"),
 ]
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -116,7 +123,7 @@ def compute_mre(src_pts: np.ndarray, dst_pts: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────
-# PREPROCESSING: CLAHE CONTRAST ENHANCEMENT
+# PREPROCESSING: CLAHE CONTRAST ENHANCEMENT here 
 # ─────────────────────────────────────────────────────────────
 
 def enhance_image(img: np.ndarray) -> np.ndarray:
@@ -127,6 +134,67 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
     """
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(img)
+
+
+# ─────────────────────────────────────────────────────────────
+# AUTO-SELECTION: BEST FEATURE METHOD (ORB vs SIFT)
+# ─────────────────────────────────────────────────────────────
+
+def select_best_method(img_orig1: np.ndarray, img_orig2: np.ndarray) -> str:
+    """
+    Probe both ORB and SIFT on CLAHE-enhanced images and return the method
+    with the higher RANSAC inlier ratio.  Ties go to ORB (faster, patent-free).
+
+    This replaces the former 'for method in ["ORB","SIFT"]' loop so that
+    only one full registration run is performed per same-modal pair, and
+    only the more reliable result is saved.
+
+    Returns: 'ORB' or 'SIFT'
+    """
+    scores: dict[str, float] = {}
+
+    for method in ["ORB", "SIFT"]:
+        if method == "ORB":
+            det       = cv2.ORB_create(nfeatures=3000)
+            norm_type = cv2.NORM_HAMMING
+        else:
+            det       = cv2.SIFT_create(nfeatures=3000)
+            norm_type = cv2.NORM_L2
+
+        img1 = enhance_image(img_orig1)
+        img2 = enhance_image(img_orig2)
+        kp1, des1 = det.detectAndCompute(img1, None)
+        kp2, des2 = det.detectAndCompute(img2, None)
+
+        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
+            scores[method] = 0.0
+            continue
+
+        bf   = cv2.BFMatcher(norm_type)
+        knn  = bf.knnMatch(des1, des2, k=2)
+        good = [
+            m for pair in knn if len(pair) == 2
+            for m, n in [pair] if m.distance < 0.75 * n.distance
+        ]
+
+        if len(good) < 10:
+            scores[method] = 0.0
+            continue
+
+        src = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        scores[method] = (
+            float(np.sum(mask.ravel())) / len(mask.ravel())
+            if mask is not None else 0.0
+        )
+
+    best = max(scores, key=scores.get)
+    print(
+        f"  [method probe]   ORB={scores.get('ORB', 0):.3f}  "
+        f"SIFT={scores.get('SIFT', 0):.3f}  →  using {best}"
+    )
+    return best
 
 
 # ─────────────────────────────────────────────────────────────
@@ -237,7 +305,7 @@ def register_same_modality(img_orig1: np.ndarray, img_orig2: np.ndarray,
 
     Pipeline:
       1. CLAHE enhancement for detection only (originals used for output)
-      2. Detect keypoints + descriptors (ORB or SIFT)
+      2. Detect keypoints + descriptors (ORB or SIFT — pre-selected by probe)
       3. BFMatcher + Lowe ratio test (threshold = 0.75)
       4. RANSAC homography estimation (reprojection threshold = 5.0 px)
       5. MRE computed over RANSAC inliers as GCPs (≥ 5 required)
@@ -254,7 +322,7 @@ def register_same_modality(img_orig1: np.ndarray, img_orig2: np.ndarray,
     Args:
         img_orig1  : raw grayscale image 1 (unenhanced)
         img_orig2  : raw grayscale image 2 (unenhanced)
-        method     : "ORB" or "SIFT"
+        method     : "ORB" or "SIFT" — chosen by select_best_method()
         pair_label : used for output filenames
         output_dir : directory for all saved outputs
 
@@ -684,8 +752,12 @@ def _print_table(title: str, df: pd.DataFrame):
 def run_all():
     """
     Process all three target folders sequentially:
-      P1W2, P2W2 → same-modal (ORB + SIFT)
-      P3W2       → cross-modal (MI maximisation)
+
+      For each folder:
+        1. Modality is read directly from TARGET_FOLDERS — authoritative.
+        2. Same-modal  → probe ORB vs SIFT inlier ratios → run only the winner.
+        3. Cross-modal → SimpleITK Mattes MI maximisation.
+
     Saves a unified CSV summary and prints failure analysis.
     """
     print("\n" + "=" * 60)
@@ -704,22 +776,25 @@ def run_all():
 
         print(f"\n  {folder}/  →  {Path(path1).name}  +  {Path(path2).name}  [{mode}-modal]")
 
+        # ── Load images ──────────────────────────────────────────────────
+        img_orig1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
+        img_orig2 = cv2.imread(path2, cv2.IMREAD_GRAYSCALE)
+        if img_orig1 is None or img_orig2 is None:
+            print(f"  [ERROR] Could not load images in {folder}/ — skipping")
+            continue
+
+        # ── Dispatch on authoritative modality label ─────────────────────
         if mode == "same":
-            # Load originals; CLAHE is handled inside register_same_modality
-            img_orig1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
-            img_orig2 = cv2.imread(path2, cv2.IMREAD_GRAYSCALE)
-            if img_orig1 is None or img_orig2 is None:
-                print(f"  [ERROR] Could not load images in {folder}/ — skipping")
-                continue
-            for method in ["ORB", "SIFT"]:
-                r = register_same_modality(
-                    img_orig1, img_orig2,
-                    method=method,
-                    pair_label=label,
-                    output_dir="results/same_modal"
-                )
-                if r:
-                    all_results.append(r)
+            # Probe both detectors; run full registration only with winner
+            best_method = select_best_method(img_orig1, img_orig2)
+            r = register_same_modality(
+                img_orig1, img_orig2,
+                method=best_method,
+                pair_label=label,
+                output_dir="results/same_modal"
+            )
+            if r:
+                all_results.append(r)
 
         else:  # cross-modal: path1=IR (alphabetically first), path2=Visible
             r = register_cross_modal(
@@ -731,7 +806,7 @@ def run_all():
             if r:
                 all_results.append(r)
 
-    # Save unified results CSV
+    # ── Save unified results CSV ─────────────────────────────────────────
     if all_results:
         df = pd.DataFrame(all_results)
         os.makedirs("results", exist_ok=True)
@@ -740,7 +815,7 @@ def run_all():
         _print_table("REGISTRATION SUMMARY — ALL PAIRS", df)
         print(f"\n  CSV saved → {csv_path}")
 
-    # Print failure analysis (rubric requirement)
+    # ── Print failure analysis (rubric requirement) ──────────────────────
     print_failure_analysis()
 
 
