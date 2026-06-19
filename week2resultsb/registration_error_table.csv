@@ -1,0 +1,6 @@
+pair,sift_good_matches,sift_inliers,sift_inlier_ratio,mi_final_value,mre_px,mre_std_px,n_gcps,figure
+1,6,0,0.0,-0.60425,9.807,8.545,5,week2resultsb\1_comparison.png
+2,11,4,0.364,-0.68271,7.173,1.691,5,week2resultsb\2_comparison.png
+3,44,27,0.614,-0.64015,10.332,6.713,5,week2resultsb\3_comparison.png
+4,4,4,1.0,-0.74491,8.809,4.377,5,week2resultsb\4_comparison.png
+5,10,5,0.5,-0.85335,7.296,3.937,5,week2resultsb\5_comparison.png
